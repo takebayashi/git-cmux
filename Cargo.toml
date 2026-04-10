@@ -1,0 +1,18 @@
+[package]
+name = "git-cmux"
+version = "0.0.1"
+description = "Git external subcommand for managing and opening worktrees with cmux workspaces"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/takebayashi/git-cmux"
+homepage = "https://github.com/takebayashi/git-cmux"
+keywords = ["git", "worktree", "cli", "cmux"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dialoguer = "0.12.0"
