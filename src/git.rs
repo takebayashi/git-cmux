@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Output};
+use std::process::{Command, Output};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worktree {
@@ -70,21 +70,32 @@ fn repo_root_path(stdout: &str) -> PathBuf {
 fn branch_exists(branch: &str) -> Result<bool> {
     let mut command = git_command();
     command.args(["show-ref", "--exists", &format!("refs/heads/{}", branch)]);
-    let status = command
-        .status()
+    let output = command
+        .output()
         .with_context(|| format!("Failed to run git show-ref --exists for branch {}", branch))?;
-    branch_exists_from_status(branch, status)
-}
-
-fn branch_exists_from_status(branch: &str, status: ExitStatus) -> Result<bool> {
-    match status.code() {
+    match output.status.code() {
         Some(0) => Ok(true),
         Some(2) => Ok(false),
-        Some(code) => anyhow::bail!(
-            "git show-ref --exists failed for branch {} with exit code {}",
-            branch,
-            code
-        ),
+        Some(code) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("not a git repository") {
+                anyhow::bail!("Not inside a git repository");
+            }
+            let stderr = stderr.trim();
+            if stderr.is_empty() {
+                anyhow::bail!(
+                    "git show-ref --exists failed for branch {} with exit code {}",
+                    branch,
+                    code
+                );
+            }
+            anyhow::bail!(
+                "git show-ref --exists failed for branch {} with exit code {}: {}",
+                branch,
+                code,
+                stderr
+            );
+        }
         None => anyhow::bail!(
             "git show-ref --exists failed for branch {} without an exit code",
             branch
@@ -128,13 +139,12 @@ fn parse_worktree_block(block: &str) -> Result<Worktree> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Worktree, branch_exists_from_status, branch_name, parse_worktree_list, repo_root_path,
-    };
-    #[cfg(unix)]
-    use std::os::unix::process::ExitStatusExt;
-    use std::path::PathBuf;
-    use std::process::ExitStatus;
+    use super::{Worktree, branch_exists, branch_name, parse_worktree_list, repo_root_path};
+    use anyhow::Result;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parse_worktree_list_reads_branch_entries() {
@@ -210,29 +220,107 @@ branch refs/heads/main
     }
 
     #[test]
-    fn branch_exists_from_status_maps_exists_and_missing() {
-        assert_eq!(
-            branch_exists_from_status("main", exit_status(0)).unwrap(),
-            true
-        );
-        assert_eq!(
-            branch_exists_from_status("main", exit_status(2)).unwrap(),
-            false
-        );
+    fn branch_exists_maps_exists_and_missing() {
+        let repo = init_repo();
+        run_git(repo.path(), &["branch", "feature/test"]);
+
+        assert!(branch_exists_at(&repo, "feature/test").unwrap());
+        assert!(!branch_exists_at(&repo, "missing").unwrap());
     }
 
     #[test]
-    fn branch_exists_from_status_rejects_other_exit_codes() {
-        let err = branch_exists_from_status("main", exit_status(1)).unwrap_err();
+    fn branch_exists_maps_not_a_git_repository() {
+        let temp = TempDir::new();
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp.path()).unwrap();
+
+        let err = branch_exists("main").unwrap_err();
+
+        std::env::set_current_dir(cwd).unwrap();
+
+        assert_eq!(err.to_string(), "Not inside a git repository");
+    }
+
+    #[test]
+    fn branch_exists_handles_git_errors_without_printing_to_terminal() {
+        let repo = init_repo();
+        let refs_path = repo.path().join(".git/refs/heads");
+        fs::remove_dir_all(&refs_path).unwrap();
+        fs::write(&refs_path, b"broken").unwrap();
+
+        let err = branch_exists_at(&repo, "main").unwrap_err();
 
         assert!(
             err.to_string()
-                .contains("git show-ref --exists failed for branch main with exit code 1")
+                .contains("git show-ref --exists failed for branch main with exit code")
         );
     }
 
-    #[cfg(unix)]
-    fn exit_status(code: i32) -> ExitStatus {
-        ExitStatusExt::from_raw(code << 8)
+    fn init_repo() -> TempDir {
+        let repo = TempDir::new();
+        run_git(repo.path(), &["init"]);
+        run_git(repo.path(), &["config", "user.name", "git-cmux test"]);
+        run_git(
+            repo.path(),
+            &["config", "user.email", "git-cmux@example.com"],
+        );
+        run_git(repo.path(), &["commit", "--allow-empty", "-m", "init"]);
+        repo
+    }
+
+    fn branch_exists_at(repo: &TempDir, branch: &str) -> Result<bool> {
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(repo.path()).unwrap();
+        let result = branch_exists(branch);
+        std::env::set_current_dir(cwd).unwrap();
+        result
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed with status {:?}: {}",
+            args,
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let millis = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            let path = std::env::temp_dir().join(format!(
+                "git-cmux-test-{}-{}-{}",
+                std::process::id(),
+                millis,
+                unique
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
